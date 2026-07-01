@@ -229,10 +229,14 @@ class VLLM(lmms):
             kwargs["distributed_executor_backend"] = "external_launcher"
             if expected_world_size > 1 and accelerator.num_processes != expected_world_size:
                 raise ValueError("For external_launcher mode, accelerate world size must equal " f"tensor_parallel_size * data_parallel_size ({expected_world_size}), " f"but got {accelerator.num_processes}.")
+        # data_parallel_size was only added to vLLM EngineArgs in 0.8+. On older
+        # vLLM (e.g. 0.7.3) passing it raises TypeError, so only include it when
+        # actually using DP>1 (the default single-replica case doesn't need it).
+        if int(self.data_parallel_size) > 1:
+            kwargs["data_parallel_size"] = self.data_parallel_size
         self.client = LLM(
             model=self.model,
             tensor_parallel_size=self.tensor_parallel_size,
-            data_parallel_size=self.data_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             trust_remote_code=trust_remote_code,
             disable_log_stats=disable_log_stats,

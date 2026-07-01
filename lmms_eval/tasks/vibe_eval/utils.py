@@ -1,3 +1,5 @@
+import base64
+import io
 import os
 import re
 from copy import deepcopy
@@ -7,22 +9,37 @@ from pathlib import Path
 from typing import List, Optional
 
 import yaml
-
-try:
-    from reka import ChatMessage
-    from reka.client import Reka
-except ImportError:
-    eval_logger.warning("Reka is not installed, please install it by `pip install reka-api`")
-
 from loguru import logger as eval_logger
 
-try:
-    from reka import ChatMessage
-    from reka.client import Reka
-except ImportError:
-    eval_logger.warning("Reka is not installed, please install it by `pip install reka-api`")
-
 REKA_API_KEY = os.getenv("REKA_API_KEY", "YOUR_API_KEY")
+
+
+# ---- local judge (image-aware) ----
+# The original vibe_eval grades via Reka's hosted API, which isn't available here. We grade
+# instead with a local vLLM OpenAI-compatible server (Gemma-4-31B, a multimodal model), so
+# the judge still SEES the image like Reka-Core did. Endpoint comes from env vars; falls
+# back to the generic OPENAI_* vars the sbatch already exports for the judge.
+def _get_judge_client():
+    api_key = os.getenv("VIBE_EVAL_JUDGE_API_KEY") or os.getenv("OPENAI_API_KEY", "EMPTY")
+    base_url = os.getenv("VIBE_EVAL_JUDGE_BASE_URL") or os.getenv("OPENAI_API_URL")
+    if not base_url:
+        eval_logger.error("VIBE_EVAL_JUDGE_BASE_URL / OPENAI_API_URL not set; point it at a vLLM OpenAI endpoint, e.g. http://host:port/v1")
+        return None
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _get_judge_model_name() -> str:
+    return os.getenv("VIBE_EVAL_JUDGE_MODEL") or os.getenv("MODEL_VERSION", "default")
+
+
+def _pil_to_data_url(image) -> str:
+    """Encode a PIL image as a base64 data URL so it can be sent offline (no GCS fetch)."""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
 with open(Path(__file__).parent / "vibe_eval.yaml", "r") as f:
     raw_data = f.readlines()
@@ -86,6 +103,7 @@ class Example:
     generation: Optional[str] = None
     score: Optional[int] = None
     evaluator_explanation: Optional[str] = None
+    image: Optional[object] = None  # PIL image, passed to the image-aware judge
 
 
 class Evaluator(Enum):
@@ -105,35 +123,40 @@ def make_evaluator_prompt(example: Example, include_image: bool) -> str:
 
 
 def evaluate(example: Example, evaluator: Evaluator) -> Example:
-    """Evaluates the generation and populates the score and explanation fields."""
-    include_image = evaluator == Evaluator.REKA_CORE
+    """Evaluates the generation and populates the score and explanation fields.
+
+    Grades via a local vLLM OpenAI-compatible judge (replacing Reka's hosted API). When the
+    judge is image-aware (Evaluator.REKA_CORE) and we have the PIL image, the image is sent
+    inline as a base64 data URL so the judge sees it, mirroring the original Reka-Core path.
+    """
+    include_image = (evaluator == Evaluator.REKA_CORE) and (example.image is not None)
     evaluator_prompt = make_evaluator_prompt(example, include_image=include_image)
-    client = Reka(api_key=REKA_API_KEY)
-    content = [
-        {"type": "text", "text": evaluator_prompt},
-    ]
+
+    client = _get_judge_client()
+    if client is None:
+        example.score = 0
+        example.evaluator_explanation = "Judge client unavailable"
+        return example
+
+    content = [{"type": "text", "text": evaluator_prompt}]
     if include_image:
-        content.append({"type": "image_url", "image_url": example.media_url})
-    evaluator_response = client.chat.create(
-        messages=[
-            ChatMessage(
-                content=content,
-                role="user",
-            )
-        ],
-        model="reka-core",
-        temperature=0.4,
-        max_tokens=1024,
-    )
-    evaluator_response = evaluator_response.responses[0].message.content
-    # evaluator_response = reka.chat(
-    # human=evaluator_prompt,
-    # media_url=example.media_url if include_image else None,
-    # temperature=0.4,
-    # model_name="reka-core-20240415",
-    # request_output_len=1024,
-    # )["text"]
-    re_match = re.search(r"Rating:\s*([1-5])", evaluator_response)
+        content.append({"type": "image_url", "image_url": {"url": _pil_to_data_url(example.image)}})
+
+    try:
+        response = client.chat.completions.create(
+            model=_get_judge_model_name(),
+            messages=[{"role": "user", "content": content}],
+            temperature=0.4,
+            max_tokens=1024,
+        )
+        evaluator_response = response.choices[0].message.content
+    except Exception as e:  # noqa: BLE001 - never let one judge call abort the whole run
+        eval_logger.warning(f"vibe_eval judge call failed for {example.example_id}: {e}")
+        example.score = 0
+        example.evaluator_explanation = f"Judge error: {e}"
+        return example
+
+    re_match = re.search(r"Rating:\s*([1-5])", evaluator_response or "")
     if re_match is None:
         example.score = 0
         example.evaluator_explanation = evaluator_response
@@ -164,7 +187,8 @@ def vibe_process_results(doc, results):
     media_filename = doc["media_url"]
     media_url = doc["media_url"]
     generation = results[0]
-    example = Example(example_id=example_id, category=category, prompt=prompt, reference=reference, media_filename=media_filename, media_url=media_url, generation=generation)
+    image = doc.get("image")  # PIL image embedded in RekaAI/VibeEval; sent to the image-aware judge
+    example = Example(example_id=example_id, category=category, prompt=prompt, reference=reference, media_filename=media_filename, media_url=media_url, generation=generation, image=image)
 
     evaluator = Evaluator.REKA_CORE if EVALUATOR_NAME == "reka-core" else Evaluator.REKA_CORE_TEXT
 
@@ -187,6 +211,9 @@ def vibe_process_results(doc, results):
 
 def _mean(scores: List[int]) -> float:
     """Scale from 1-5 to 0-100 and compute means."""
+    # A category can be empty under --limit (smoke tests), which would div-by-zero.
+    if not scores:
+        return 0.0
     return sum(25 * (score - 1) for score in scores) / len(scores)
 
 

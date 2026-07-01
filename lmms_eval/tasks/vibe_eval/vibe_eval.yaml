@@ -27,7 +27,9 @@ metric_list:
     aggregation: !function utils.vibe_aggregation_results_all
     higher_is_better: true
 metadata:
-  evaluator: "reka-core-text"
+  # "reka-core" => image-aware judging (the local multimodal Gemma judge sees the image,
+  # like the original Reka-Core). "reka-core-text" would grade on text only.
+  evaluator: "reka-core"
 
 lmms_eval_specific_kwargs:
   default:

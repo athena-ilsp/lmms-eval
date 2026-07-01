@@ -223,6 +223,10 @@ class VLLM(VLLMSimple):
         return results
 
     def get_format_metrics(self):
+        # Older/offline vLLM builds (e.g. 0.7.3) don't expose LLM.get_metrics(); this is
+        # only throughput logging, so degrade gracefully instead of aborting the eval.
+        if not hasattr(self.client, "get_metrics"):
+            return {"ttft": 0, "tpot": 0, "generation_tokens": 0}
         metrics = self.client.get_metrics()
         ttft = 0
         tpot = 0

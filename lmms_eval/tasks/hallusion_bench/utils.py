@@ -8,8 +8,18 @@ from tqdm import tqdm
 
 API_TYPE = os.getenv("API_TYPE", "openai")
 
+# Model name for the judge. The rest of the suite (MMMU, vibe_eval) reads MODEL_VERSION to
+# point the judge at our local vLLM server (e.g. gemma4-31b-judge). HallusionBench used to
+# hardcode "gpt-4", which our server rejects -> every judge call failed -> everything scored
+# "unclear" -> aAcc/fAcc/qAcc = 0. Honor MODEL_VERSION here too.
+JUDGE_MODEL = os.getenv("MODEL_VERSION", "gpt-4")
+
 if API_TYPE == "openai":
     API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+    # The suite exports OPENAI_API_URL as the base (.../v1); this module posts with raw
+    # requests, so append the chat-completions path if it's not already there.
+    if not API_URL.rstrip("/").endswith("/chat/completions"):
+        API_URL = API_URL.rstrip("/") + "/chat/completions"
     API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_API_KEY")
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -26,7 +36,7 @@ elif API_TYPE == "azure":
 from loguru import logger as eval_logger
 
 
-def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4", load_json=False, save_json_path="./hallusion_output.json", retries=3):
+def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model=JUDGE_MODEL, load_json=False, save_json_path="./hallusion_output.json", retries=3):
     if load_json and os.path.exists(save_json_path):
         with open(save_json_path, "r") as f:
             output = json.load(f)
@@ -88,7 +98,7 @@ def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4"
     return output
 
 
-def check_same_by_chatgpt(data, output_entry, gpt_model="gpt-4", load_json=False, save_json_path="./hallusion_output.json", retries=3):
+def check_same_by_chatgpt(data, output_entry, gpt_model=JUDGE_MODEL, load_json=False, save_json_path="./hallusion_output.json", retries=3):
     orig_response = {}
 
     for r in data:
