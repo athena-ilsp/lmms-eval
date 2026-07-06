@@ -3,6 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
+from PIL import Image
 from tqdm import tqdm
 
 from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
@@ -64,6 +65,14 @@ class VLLM(VLLMSimple):
         ctx, doc_to_messages, gen_kwargs, doc_id, task, split = request.arguments
         raw_messages = doc_to_messages(self.task_dict[task][split][doc_id])
         chat_messages = ChatMessages(messages=raw_messages)
+        # This path (chat-mode messages) bypasses simple/vllm.py's encode_image, so images
+        # here never got the Qwen-VL min-28px resize -> a tiny image (e.g. 272x26) makes the
+        # HF processor raise "must be larger than factor:28" deep inside vLLM. Apply the same
+        # resize here.
+        for message in chat_messages.messages:
+            for content in message.content:
+                if content.type == "image" and isinstance(content.url, Image.Image):
+                    content.url = self._maybe_resize_image(content.url)
         # Copy to avoid side-effects across threads
         _gen = dict(gen_kwargs or {})
         _gen["max_new_tokens"] = self._select_max_new_tokens(_gen.get("max_new_tokens"))

@@ -63,7 +63,7 @@ everything else falls back to the sbatch defaults:
 ```bash
 cd /leonardo_work/EUHPC_D26_056/nxiros/VLM-evaluation/lmms-eval/leonardo-slurm
 
-./run.sh                                       # full default run (16 tasks, LIMIT=500)
+./run.sh                                       # default run (9 tasks, LIMIT=500/task)
 ./run.sh --tasks ai2d,mmmu_val --limit 50      # specific tasks, 50 samples each
 ./run.sh --model llava-hf/llava-1.5-7b-hf       # different evaluated VLM
 ./run.sh --tasks vibe_eval --limit 0            # one task, full set (no cap)
@@ -83,6 +83,13 @@ and is a **cu12** build (Leonardo's 12.2 driver rejects cu13 — see Environment
 grading (`vibe_eval`, `hallusion_bench_image`) needs a **VLM** judge; a text-only judge still
 grades the text tasks (`vibe_eval_greek`, MMMU) but scores image tasks on text alone.
 
+Swapping the evaluated model: `vlm_eval_vllm` (vLLM 0.7.3) doesn't know newer archs like
+`qwen3_vl`. **`Qwen/Qwen3-VL-4B-Instruct` is validated** (full run, all 9 default tasks,
+real scores) by pointing `--eval-env` at `gemma4_env` instead, which has a newer vLLM that
+recognizes it — `./run.sh --model Qwen/Qwen3-VL-4B-Instruct --eval-env <path>/gemma4_env`.
+For any other model newer than vLLM 0.7.3, do the same: eval on `gemma4_env` (or another
+cu12 env with a vLLM that knows the arch) rather than upgrading `vlm_eval_vllm` in place.
+
 ### Results
 
 Watch a running job live:
@@ -94,12 +101,14 @@ tail -f leonardo-slurm/logs/lmms-eval-judge-${JID}.out     # INFO + final result
 tail -f leonardo-slurm/logs/judge_server_${JID}.log        # judge loading / requests
 ```
 
-When the job finishes, scores are written to a human-readable summary:
+When the job finishes, scores are written to a human-readable summary. The results dir is
+named `<model>_<jobid>` (model = the last path segment of `MODEL_ARGS`'s `model=`, e.g.
+`Qwen3-VL-4B-Instruct_48410805`):
 
 ```
-leonardo-slurm/results/<jobid>/SUMMARY.txt          # task | metric | value table
-leonardo-slurm/results/<jobid>/.../*_results.json   # full machine-readable results
-leonardo-slurm/logs/lmms-eval-judge-<jobid>.out     # run log (also prints the table at the end)
+leonardo-slurm/results/<model>_<jobid>/SUMMARY.txt          # task | metric | value table
+leonardo-slurm/results/<model>_<jobid>/.../*_results.json   # full machine-readable results
+leonardo-slurm/logs/lmms-eval-judge-<jobid>.out             # run log (also prints the table at the end)
 ```
 
 `SUMMARY.txt` looks like:
@@ -144,6 +153,8 @@ The full list of task names you can pass to `--tasks` (and the dataset each need
 - **`max_model_len` / `limit_mm_per_prompt`** — size to the biggest prompt+image; multi-image
   tasks need `limit_mm_per_prompt={"image":N}` or vLLM hard-raises.
 - **`gpu_memory_utilization`** — lower (~0.7) when raising the above, or batches OOM.
+- **`EVAL_BATCH_SIZE=256`** — raised from 64: at 64, GPU KV-cache usage sat around ~5%
+  (heavily underutilized on a 3-4B model / 64GB A100). Raise further if KV usage stays low.
 - **`--output_path` / `--log_samples`** — required by HallusionBench; also persists per-task
   results so a crash doesn't lose finished work.
 
@@ -180,29 +191,3 @@ Changes made on top of upstream lmms-eval to support this local-judge, Leonardo-
   `build_gemma4_env.sh` (builds the judge's conda env from scratch, working around
   Leonardo's CUDA 12.2 driver by pinning cu12.9 torch + the matching cu129 vLLM nightly).
 
-
-
-
-
-## Example Results — Qwen2.5-VL-3B, LIMIT=500 (validation pass)
-
-> `LIMIT=500` takes the **first** 500 samples (not random). MME (a sum) and order-sensitive ratios are
-> not directly comparable. For comparable scores rerun selected tasks with `LIMIT=0`.
-
-| Task | Metric | Value |
-|------|--------|------:|
-| ai2d | exact_match | 0.834 |
-| chartqa | relaxed_overall | 0.706 |
-| docvqa_val | anls | 0.932 |
-| hallusion_bench_image | aAcc / fAcc / qAcc | 59.0 / 31.8 / 31.9 |
-| livexiv_tqa_v6 | livexiv_tqa | 0.596 |
-| mmbench_en_dev_lite | gpt_eval_score | 84.09 |
-| mme | cognition / perception | 162.5 / 283.5 (sum, capped) |
-| mmmu_pro_standard | mmmu_acc | 0.320 |
-| mmmu_val | mmmu_acc | 0.436 |
-| scienceqa_img | exact_match | 0.818 |
-| seedbench | seed_all | 0.754 |
-| textvqa_val | exact_match | 0.819 |
-| vibe_eval (image-aware judge) | all / hard / normal | 42.5 / 24.3 / 53.3 |
-| vibe_eval_greek (text judge) | all / hard / normal | 15.4 / 11.0 / 18.0 |
-| vmcbench | average | 0.628 |

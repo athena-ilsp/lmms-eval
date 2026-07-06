@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import socket
 import time
@@ -392,8 +393,11 @@ class VLLM(lmms):
         return merged_outputs[start:end]
 
     def _is_qwen_vl_model(self, model: str) -> bool:
-        qwen_vl_patterns = ["qwen2-vl", "qwen2.5-vl"]
-        return any(pattern in model.lower() for pattern in qwen_vl_patterns)
+        # All Qwen-VL generations enforce a 28px min image dimension, so match any of them
+        # (qwen2-vl, qwen2.5-vl, qwen3-vl, ...). A missing entry here silently disables the
+        # min-size resize -> tiny images crash the processor ("must be larger than factor:28").
+        m = model.lower()
+        return "qwen" in m and "-vl" in m
 
     def _maybe_resize_image(self, img: Image.Image) -> Image.Image:
         # edge‐case validation
@@ -406,7 +410,10 @@ class VLLM(lmms):
             return img
 
         scale = self.min_image_pixels / min(img.size)  # maintain original aspect ratio
-        new_size = tuple(int(dim * scale) for dim in img.size)
+        # ceil (not int floor) + per-dim clamp: int() can truncate the scaled short side back
+        # below the threshold (e.g. 26 -> 26*28/26 = 27.99 -> 27), which the Qwen-VL processor
+        # then rejects ("must be larger than factor:28"). Guarantee every dim >= min_image_pixels.
+        new_size = tuple(max(self.min_image_pixels, math.ceil(dim * scale)) for dim in img.size)
         return img.resize(new_size, Image.BICUBIC)
 
     # Function to encode the image

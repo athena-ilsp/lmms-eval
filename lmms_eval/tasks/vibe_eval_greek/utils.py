@@ -1,3 +1,5 @@
+import base64
+import io
 import os
 import re
 from copy import deepcopy
@@ -6,6 +8,14 @@ from functools import lru_cache
 from typing import List, Optional
 
 from loguru import logger as eval_logger
+
+
+def _pil_to_data_url(image) -> str:
+    """Encode a PIL image as a base64 data URL so it can be sent offline (no GCS fetch)."""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
 
 # The Greek dataset (ilsp/vibeeval_greek) does NOT embed images -- it only carries a
@@ -55,6 +65,7 @@ class Example:
     generation: Optional[str] = None
     score: Optional[int] = None
     evaluator_explanation: Optional[str] = None
+    image: Optional[object] = None  # PIL image, sent to the image-aware judge
 
 
 def _get_judge_client():
@@ -111,10 +122,14 @@ def _judge(example: Example) -> Example:
         generation=example.generation,
     )
 
+    content = [{"type": "text", "text": judge_prompt}]
+    if example.image is not None:
+        content.append({"type": "image_url", "image_url": {"url": _pil_to_data_url(example.image)}})
+
     try:
         response = client.chat.completions.create(
             model=_get_judge_model_name(),
-            messages=[{"role": "user", "content": judge_prompt}],
+            messages=[{"role": "user", "content": content}],
             temperature=0.0,
             max_tokens=512,
         )
@@ -137,6 +152,10 @@ def _judge(example: Example) -> Example:
 
 
 def vibe_el_process_results(doc, results):
+    image = doc.get("image")
+    if image is None:
+        image = _vibe_eval_image_index().get(doc["example_id"])
+
     example = Example(
         example_id=doc["example_id"],
         category=doc["category"],
@@ -144,6 +163,7 @@ def vibe_el_process_results(doc, results):
         reference=doc["reference_el"],
         media_url=doc["media_url"],
         generation=results[0],
+        image=image,
     )
 
     example = _judge(example)

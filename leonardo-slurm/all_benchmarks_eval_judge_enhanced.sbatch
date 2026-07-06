@@ -33,11 +33,19 @@ JUDGE_CONDA_ENV="${JUDGE_CONDA_ENV:-/leonardo_work/EUHPC_D33_215/solvability_fai
 
 # --- model under test (VLM) ---
 MODEL_NAME="${MODEL_NAME:-vllm}"
+
 # tensor_parallel_size=1: avoids a multi-GPU NCCL init hang seen on these nodes.
 # limit_mm_per_prompt: several tasks send multi-image prompts (vLLM defaults to 1 image).
 # gpu_memory_utilization=0.70: leaves headroom for the larger max_model_len / image limit.
-MODEL_ARGS="${MODEL_ARGS:-model=Qwen/Qwen2.5-VL-3B-Instruct,tensor_parallel_size=1,gpu_memory_utilization=0.70,max_model_len=32768,trust_remote_code=True,limit_mm_per_prompt={\"image\":8,\"video\":1}}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
+# NOTE: assign on its own line (not inline ${MODEL_ARGS:-...}) — a nested-brace JSON default
+# inside ${VAR:-word} leaks an extra '}' onto an externally-set MODEL_ARGS (double-}} bug).
+if [ -z "${MODEL_ARGS:-}" ]; then
+  MODEL_ARGS='model=Qwen/Qwen2.5-VL-3B-Instruct,tensor_parallel_size=1,gpu_memory_utilization=0.70,max_model_len=32768,trust_remote_code=True,limit_mm_per_prompt={"image":8,"video":1}'
+fi
+
+# 256: at 64 the eval GPU sat at ~5% KV-cache usage (heavily underutilized). A 3-4B VLM on a
+# 64GB A100 handles far more concurrent requests; raise to feed vLLM more work.
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 LIMIT="${LIMIT:-500}"    # per-task sample cap; 0 or empty = full run
 EVAL_CONDA_ENV="${EVAL_CONDA_ENV:-/leonardo_work/EUHPC_D26_056/nxiros/envs/vlm_eval_vllm}"
 
@@ -53,17 +61,25 @@ JUDGE_MAX_WAIT="${JUDGE_MAX_WAIT:-3600}"  # seconds to wait for the judge to com
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 
 # vibe_eval / vibe_eval_greek / mmmu_val / mmmu_pro_standard / hallusion_bench_image use the judge.
-TASKS="${TASKS:-ai2d,chartqa,docvqa_val,docvqa_test,hallusion_bench_image,mmbench_en_dev_lite,mme,mmmu_val,scienceqa_img,seedbench,textvqa_val,mmmu_pro_standard,vibe_eval,vmcbench,livexiv_tqa_v6,vibe_eval_greek}"
+# mmbench_en_dev = full dev split (real score); _lite = curated subset (LMMs-Eval-Lite, faster);
+# mmbench_en_test = held-out test split -> writes a SUBMISSION file only, no local score.
+TASKS="${TASKS:-hallusion_bench_image,mmmu_val,mmmu_pro_standard,mmbench_en_dev_lite,vibe_eval,vibe_eval_greek,vmcbench,greek_geometry_3k,geometry3k_en}"
+
+# ALL_TASKS="${TASKS:-ai2d,chartqa,docvqa_val,docvqa_test,hallusion_bench_image,mmbench_en_dev_lite,mme,mmmu_val,scienceqa_img,seedbench,textvqa_val,mmmu_pro_standard,vibe_eval,vmcbench,livexiv_tqa_v6,vibe_eval_greek,geometry3k_en}"
 # ==================================================
 
-mkdir -p "${REPO}/leonardo-slurm/logs"
+mkdir -p "${REPO}/leonardo-slurm/logs" "${JUDGE_BASE}"
 
 NODES=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 JUDGE_NODE="${NODES[0]}"
 EVAL_NODE="${NODES[1]}"
 JUDGE_URL="http://${JUDGE_NODE}:${JUDGE_PORT}/v1"
 SERVER_LOG="${REPO}/leonardo-slurm/logs/judge_server_${SLURM_JOB_ID}.log"
-RESULTS_DIR="${RESULTS_DIR:-${REPO}/leonardo-slurm/results/${SLURM_JOB_ID}}"
+# results dir named {model_name}_{job_id}: pull model= from MODEL_ARGS, take the basename
+# (drop the org/ prefix), sanitize for the filesystem.
+MODEL_TAG=$(echo "${MODEL_ARGS}" | sed -nE 's/.*model=([^,]+).*/\1/p' | sed 's#.*/##; s#[^A-Za-z0-9._-]#_#g')
+MODEL_TAG="${MODEL_TAG:-model}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO}/leonardo-slurm/results/${MODEL_TAG}_${SLURM_JOB_ID}}"
 mkdir -p "${RESULTS_DIR}"
 
 if [ -n "${LIMIT:-}" ] && [ "${LIMIT}" != "0" ]; then
@@ -170,7 +186,14 @@ srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" --gres=gpu:4 --overlap \
     export VLLM_CACHE_ROOT=${CACHE_ROOT}/.vllm_cache
     export TORCHINDUCTOR_CACHE_DIR=${CACHE_ROOT}/.torchinductor_cache
     export TRITON_CACHE_DIR=${CACHE_ROOT}/.triton_cache
-    mkdir -p \"\$VLLM_CACHE_ROOT\" \"\$TORCHINDUCTOR_CACHE_DIR\" \"\$TRITON_CACHE_DIR\"
+    export FLASHINFER_WORKSPACE_BASE=${CACHE_ROOT}/.flashinfer_cache
+    mkdir -p \"\$VLLM_CACHE_ROOT\" \"\$TORCHINDUCTOR_CACHE_DIR\" \"\$TRITON_CACHE_DIR\" \"\$FLASHINFER_WORKSPACE_BASE\"
+    # Newer-vLLM eval envs (e.g. gemma4_env for Qwen3-VL) would JIT-compile FlashInfer's sampler
+    # at startup, but the compute node has no nvcc -> 'ninja build failed'. Use the native
+    # PyTorch sampler instead; point CUDA_HOME at the env's bundled cu13 toolkit if present.
+    export VLLM_USE_FLASHINFER_SAMPLER=0
+    CU13=\"\$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cu13\"
+    [ -d \"\$CU13\" ] && { export CUDA_HOME=\"\$CU13\"; export PATH=\"\$CUDA_HOME/bin:\$PATH\"; }
 
     # Judge endpoint for vibe_eval_greek.
     export VIBE_EVAL_GREEK_JUDGE_BASE_URL='${JUDGE_URL}'
@@ -196,38 +219,11 @@ srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" --gres=gpu:4 --overlap \
 EVAL_RC=$?
 
 # ---- 4. distil lmms_eval's results.json into a human-readable SUMMARY.txt ----
-python3 - "$RESULTS_DIR" "$SLURM_JOB_ID" "$MODEL_ARGS" "$TASKS" "$LIMIT" <<'PYEOF' || true
-import json, sys, glob, os
-results_dir, jobid, model_args, tasks, limit = sys.argv[1:6]
-files = sorted(glob.glob(os.path.join(results_dir, "**", "*_results.json"), recursive=True),
-               key=os.path.getmtime)
-if not files:
-    print("[summary] no *_results.json found; skipping SUMMARY.txt"); sys.exit(0)
-data = json.load(open(files[-1]))
-res  = data.get("results", {})
-model = data.get("model_name") or model_args.split(",")[0]
-
-lines = []
-lines.append(f"# lmms-eval summary  (job {jobid})")
-lines.append(f"model   : {model}")
-lines.append(f"limit   : {limit} per task")
-lines.append(f"date    : {data.get('date','?')}")
-lines.append(f"results : {files[-1]}")
-lines.append("")
-lines.append(f"{'task':<26} {'metric':<26} {'value':>10}")
-lines.append("-" * 64)
-for task in sorted(res):
-    row = res[task]
-    for key, val in row.items():
-        if key == "alias" or "stderr" in key: continue
-        if not isinstance(val, (int, float)): continue
-        metric = key.split(",")[0]
-        lines.append(f"{task:<26} {metric:<26} {val:>10.4f}")
-out = os.path.join(results_dir, "SUMMARY.txt")
-open(out, "w").write("\n".join(lines) + "\n")
-print("[summary] wrote", out)
-print("\n".join(lines))
-PYEOF
+# Runs in the top-level batch shell (no conda env active here), so load a python module
+# to guarantee python3 is on PATH. || true: a summary failure must not fail the job.
+module load anaconda3/2023.09-0 2>/dev/null || module load python 2>/dev/null || true
+python3 "${REPO}/leonardo-slurm/summarize_results.py" \
+  "$RESULTS_DIR" "$SLURM_JOB_ID" "$MODEL_ARGS" "$TASKS" "$LIMIT" || true
 
 echo "[done] eval exit code: $EVAL_RC"
 echo "[done] results dir  : $RESULTS_DIR   (see SUMMARY.txt)"
