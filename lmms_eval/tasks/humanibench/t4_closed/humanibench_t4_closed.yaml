@@ -1,0 +1,35 @@
+dataset_name: task4_Multilingual_CloseEnded
+task: humanibench_t4_closed
+include: ../_default_template_yaml
+process_docs: !function utils_t4_closed.process_docs
+doc_to_visual: !function utils_t4_closed.doc_to_visual
+doc_to_text: !function utils_t4_closed.doc_to_text
+doc_to_messages: !function utils_t4_closed.doc_to_messages
+doc_to_target: "Answer"
+process_results: !function utils_t4_closed.process_results
+metric_list:
+  - metric: accuracy_statistical
+    aggregation: !function utils_t4_closed.aggregate_accuracy_statistical
+    higher_is_better: true
+  - metric: accuracy
+    aggregation: !function utils_t4_closed.aggregate_accuracy
+    higher_is_better: true
+  - metric: bias
+    aggregation: !function utils_t4_closed.aggregate_bias
+    higher_is_better: false
+  - metric: hallucination
+    aggregation: !function utils_t4_closed.aggregate_hallucination
+    higher_is_better: false
+  - metric: faithfulness
+    aggregation: !function utils_t4_closed.aggregate_faithfulness
+    higher_is_better: true
+  - metric: contextual_relevance
+    aggregation: !function utils_t4_closed.aggregate_contextual_relevance
+    higher_is_better: true
+  - metric: coherence
+    aggregation: !function utils_t4_closed.aggregate_coherence
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

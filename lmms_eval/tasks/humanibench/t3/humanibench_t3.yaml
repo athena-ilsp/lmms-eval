@@ -1,0 +1,34 @@
+dataset_name: task3_Multiple_Choice_VQA
+task: humanibench_t3
+include: ../_default_template_yaml
+doc_to_visual: !function utils_t3.doc_to_visual
+doc_to_text: !function utils_t3.doc_to_text
+doc_to_messages: !function utils_t3.doc_to_messages
+doc_to_target: "Answer"
+process_results: !function utils_t3.process_results
+metric_list:
+  - metric: accuracy_statistical
+    aggregation: !function utils_t3.aggregate_accuracy_statistical
+    higher_is_better: true
+  - metric: accuracy
+    aggregation: !function utils_t3.aggregate_accuracy
+    higher_is_better: true
+  - metric: bias
+    aggregation: !function utils_t3.aggregate_bias
+    higher_is_better: false
+  - metric: hallucination
+    aggregation: !function utils_t3.aggregate_hallucination
+    higher_is_better: false
+  - metric: faithfulness
+    aggregation: !function utils_t3.aggregate_faithfulness
+    higher_is_better: true
+  - metric: contextual_relevance
+    aggregation: !function utils_t3.aggregate_contextual_relevance
+    higher_is_better: true
+  - metric: coherence
+    aggregation: !function utils_t3.aggregate_coherence
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

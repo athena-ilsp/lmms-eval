@@ -1,0 +1,13 @@
+dataset_path: vector-institute/HumaniBench
+dataset_kwargs:
+  token: True
+test_split: test
+output_type: generate_until
+cluster_key: ID
+generation_kwargs:
+  max_new_tokens: 128
+  temperature: 0.0
+  top_k: 1
+  do_sample: false
+metadata:
+  version: 0.0
