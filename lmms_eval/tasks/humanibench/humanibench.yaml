@@ -1,0 +1,12 @@
+group: humanibench
+task:
+  - humanibench_t1_plain
+  - humanibench_t1_cot
+  - humanibench_t2
+  - humanibench_t3
+  - humanibench_t4_closed
+  - humanibench_t4_open
+  - humanibench_t5
+  - humanibench_t6_factual
+  - humanibench_t6_empathic
+  - humanibench_t7
