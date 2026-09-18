@@ -42,6 +42,13 @@ output/
 # Logs
 logs/
 *.log
+
+# Eval run artifacts
+leonardo-jobs/results/
+
+# The bare `env` rule above is for virtualenvs; this is checked-in tooling.
+!leonardo-jobs/env/
+!leonardo-jobs/env/**
 wandb/
 zk.log
 span.log

@@ -8,15 +8,15 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=384G
 #SBATCH --time=06:00:00
-#SBATCH --output=/leonardo_work/EUHPC_D26_056/nxiros/VLM-evaluation/lmms-eval/leonardo-slurm/logs/%x-%j.out
-#SBATCH --error=/leonardo_work/EUHPC_D26_056/nxiros/VLM-evaluation/lmms-eval/leonardo-slurm/logs/%x-%j.err
+#SBATCH --output=/leonardo_work/EUHPC_D26_056/nxiros/VLM-evaluation/lmms-eval/leonardo-jobs/logs/%x-%j.out
+#SBATCH --error=/leonardo_work/EUHPC_D26_056/nxiros/VLM-evaluation/lmms-eval/leonardo-jobs/logs/%x-%j.err
 #
 # Two-node job for LLM-as-judge VLM benchmarks (vibe_eval, vibe_eval_greek, mmmu, hallusion):
 #   NODE 0 -> vLLM judge server (Gemma-4-31B-it, TP=2)   [conda gemma4_env]
 #   NODE 1 -> lmms_eval VLM benchmarks (Qwen2.5-VL-3B, TP=1) [conda vlm_eval_vllm]
 # The eval node reaches the judge over Leonardo's internal network by hostname.
 #
-# Usage: prefer ./run.sh (see llm-judge-setup/README.md), or submit directly:
+# Usage: prefer ./run.sh (see ../README.md), or submit directly:
 #   sbatch all_benchmarks_eval_judge_enhanced.sbatch
 #   sbatch --export=ALL,TASKS=mmmu_val,LIMIT=0 all_benchmarks_eval_judge_enhanced.sbatch
 set -euo pipefail
@@ -28,7 +28,7 @@ CACHE_ROOT="/leonardo_work/EUHPC_D26_056/nxiros"
 HF_HOME_DIR="${CACHE_ROOT}/hf_cache"
 
 # Judge server env: needs a vLLM build that knows the Gemma-4 (gemma4) architecture.
-# See llm-judge-setup/README.md for why this must be a cu12 build on Leonardo.
+# See ../README.md for why this must be a cu12 build on Leonardo.
 JUDGE_CONDA_ENV="${JUDGE_CONDA_ENV:-/leonardo_work/EUHPC_D33_215/solvability_faithfulness/envs/gemma4_env}"
 
 # --- model under test (VLM) ---
@@ -39,6 +39,7 @@ MODEL_NAME="${MODEL_NAME:-vllm}"
 # gpu_memory_utilization=0.70: leaves headroom for the larger max_model_len / image limit.
 # NOTE: assign on its own line (not inline ${MODEL_ARGS:-...}) — a nested-brace JSON default
 # inside ${VAR:-word} leaks an extra '}' onto an externally-set MODEL_ARGS (double-}} bug).
+
 if [ -z "${MODEL_ARGS:-}" ]; then
   MODEL_ARGS='model=Qwen/Qwen2.5-VL-3B-Instruct,tensor_parallel_size=1,gpu_memory_utilization=0.70,max_model_len=32768,trust_remote_code=True,limit_mm_per_prompt={"image":8,"video":1}'
 fi
@@ -61,25 +62,48 @@ JUDGE_MAX_WAIT="${JUDGE_MAX_WAIT:-3600}"  # seconds to wait for the judge to com
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 
 # vibe_eval / vibe_eval_greek / mmmu_val / mmmu_pro_standard / hallusion_bench_image use the judge.
-# mmbench_en_dev = full dev split (real score); _lite = curated subset (LMMs-Eval-Lite, faster);
-# mmbench_en_test = held-out test split -> writes a SUBMISSION file only, no local score.
+
 TASKS="${TASKS:-hallusion_bench_image,mmmu_val,mmmu_pro_standard,mmbench_en_dev_lite,vibe_eval,vibe_eval_greek,vmcbench,greek_geometry_3k,geometry3k_en}"
 
 # ALL_TASKS="${TASKS:-ai2d,chartqa,docvqa_val,docvqa_test,hallusion_bench_image,mmbench_en_dev_lite,mme,mmmu_val,scienceqa_img,seedbench,textvqa_val,mmmu_pro_standard,vibe_eval,vmcbench,livexiv_tqa_v6,vibe_eval_greek,geometry3k_en}"
 # ==================================================
 
-mkdir -p "${REPO}/leonardo-slurm/logs" "${JUDGE_BASE}"
+mkdir -p "${REPO}/leonardo-jobs/logs" "${JUDGE_BASE}"
+
+# Tasks that grade through the judge endpoint. Anything outside this list runs
+# offline, so the judge node is pure overhead (a 31B model takes ~20 min to load).
+JUDGE_TASKS="${JUDGE_TASKS:-vibe_eval,vibe_eval_greek,mmmu_val,mmmu_pro_standard,hallusion_bench_image,mmbench_en_dev_lite,geometry3k_en}"
+
+# USE_JUDGE=1/0 forces it on/off; unset means "decide from TASKS".
+if [ -z "${USE_JUDGE:-}" ]; then
+  USE_JUDGE=0
+  for _t in ${TASKS//,/ }; do
+    case ",${JUDGE_TASKS}," in
+      *",${_t},"*) USE_JUDGE=1; break ;;
+    esac
+  done
+fi
 
 NODES=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
-JUDGE_NODE="${NODES[0]}"
-EVAL_NODE="${NODES[1]}"
-JUDGE_URL="http://${JUDGE_NODE}:${JUDGE_PORT}/v1"
-SERVER_LOG="${REPO}/leonardo-slurm/logs/judge_server_${SLURM_JOB_ID}.log"
-# results dir named {model_name}_{job_id}: pull model= from MODEL_ARGS, take the basename
-# (drop the org/ prefix), sanitize for the filesystem.
+if [ "$USE_JUDGE" = "1" ]; then
+  if [ "${#NODES[@]}" -lt 2 ]; then
+    echo "[config] ERROR: judge tasks need 2 nodes, got ${#NODES[@]}. Submit with --nodes=2." >&2
+    exit 1
+  fi
+  JUDGE_NODE="${NODES[0]}"
+  EVAL_NODE="${NODES[1]}"
+  JUDGE_URL="http://${JUDGE_NODE}:${JUDGE_PORT}/v1"
+else
+  # No judge: eval runs on the only node we asked for.
+  JUDGE_NODE=""
+  EVAL_NODE="${NODES[0]}"
+  JUDGE_URL=""
+fi
+SERVER_LOG="${REPO}/leonardo-jobs/logs/judge_server_${SLURM_JOB_ID}.log"
+
 MODEL_TAG=$(echo "${MODEL_ARGS}" | sed -nE 's/.*model=([^,]+).*/\1/p' | sed 's#.*/##; s#[^A-Za-z0-9._-]#_#g')
 MODEL_TAG="${MODEL_TAG:-model}"
-RESULTS_DIR="${RESULTS_DIR:-${REPO}/leonardo-slurm/results/${MODEL_TAG}_${SLURM_JOB_ID}}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO}/leonardo-jobs/results/${MODEL_TAG}_${SLURM_JOB_ID}}"
 mkdir -p "${RESULTS_DIR}"
 
 if [ -n "${LIMIT:-}" ] && [ "${LIMIT}" != "0" ]; then
@@ -91,12 +115,17 @@ else
 fi
 
 echo "=========================================="
-echo "Judge node : $JUDGE_NODE  (vLLM ${JUDGE_SERVED_NAME}, TP=${JUDGE_TP})"
+if [ "$USE_JUDGE" = "1" ]; then
+  echo "Judge node : $JUDGE_NODE  (vLLM ${JUDGE_SERVED_NAME}, TP=${JUDGE_TP})"
+  echo "Judge URL  : $JUDGE_URL"
+  echo "Server log : $SERVER_LOG"
+else
+  echo "Judge      : DISABLED (no judge-using task in TASKS)"
+fi
 echo "Eval node  : $EVAL_NODE   (lmms_eval ${MODEL_NAME})"
-echo "Judge URL  : $JUDGE_URL"
-echo "Server log : $SERVER_LOG"
 echo "=========================================="
 
+if [ "$USE_JUDGE" = "1" ]; then
 # ---- 1. start the judge server on NODE 0 (background srun step) ----
 srun --nodes=1 --ntasks=1 --nodelist="$JUDGE_NODE" --gres=gpu:4 \
   bash -c "
@@ -165,9 +194,10 @@ done
 if [ "$READY" -ne 1 ]; then
   echo "[wait] ERROR: judge not ready in time. Last log:"; tail -50 "$SERVER_LOG"; exit 1
 fi
+fi  # USE_JUDGE
 
 # ---- 3. run lmms_eval on NODE 1, pointing the judge env vars at NODE 0 ----
-srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" --gres=gpu:4 --overlap \
+srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" --gres=gpu:4 ${USE_JUDGE:+--overlap} \
   bash -c "
     set -euo pipefail
     source ~/miniconda3/etc/profile.d/conda.sh
@@ -219,10 +249,9 @@ srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" --gres=gpu:4 --overlap \
 EVAL_RC=$?
 
 # ---- 4. distil lmms_eval's results.json into a human-readable SUMMARY.txt ----
-# Runs in the top-level batch shell (no conda env active here), so load a python module
-# to guarantee python3 is on PATH. || true: a summary failure must not fail the job.
+
 module load anaconda3/2023.09-0 2>/dev/null || module load python 2>/dev/null || true
-python3 "${REPO}/leonardo-slurm/summarize_results.py" \
+python3 "${REPO}/leonardo-jobs/summarize_results.py" \
   "$RESULTS_DIR" "$SLURM_JOB_ID" "$MODEL_ARGS" "$TASKS" "$LIMIT" || true
 
 echo "[done] eval exit code: $EVAL_RC"
